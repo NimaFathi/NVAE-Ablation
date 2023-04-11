@@ -22,9 +22,10 @@ import datasets
 
 from fid.fid_score import compute_statistics_of_generator, load_statistics, calculate_frechet_distance
 from fid.inception import InceptionV3
+from comet import CometML
 
 
-def main(args):
+def main(args, comet_logger=None):
     # ensures that weight initializations are all the same
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -36,9 +37,9 @@ def main(args):
 
     # Get data loaders.
     train_queue, valid_queue, num_classes = datasets.get_loaders(args)
+    # train_queue = torch.utils.data.Subset(train_queue, list(range(1, len(train_queue), 10)))
     args.num_total_iter = len(train_queue) * args.epochs
     warmup_iters = len(train_queue) * args.warmup_epochs
-    swa_start = len(train_queue) * (args.epochs - 1)
 
     arch_instance = utils.get_arch_cells(args.arch_instance)
 
@@ -59,7 +60,7 @@ def main(args):
 
     cnn_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         cnn_optimizer, float(args.epochs - args.warmup_epochs - 1), eta_min=args.learning_rate_min)
-    grad_scalar = GradScaler(2**10)
+    grad_scalar = GradScaler(2 ** 10)
 
     num_output = utils.num_output(args.dataset)
     bpd_coeff = 1. / np.log(2.) / num_output
@@ -78,6 +79,8 @@ def main(args):
         global_step = checkpoint['global_step']
     else:
         global_step, init_epoch = 0, 0
+    if comet_logger is not None:
+        experiment = comet_logger.get_experiment()
 
     for epoch in range(init_epoch, args.epochs):
         # update lrs.
@@ -92,13 +95,14 @@ def main(args):
         logging.info('epoch %d', epoch)
 
         # Training.
-        train_nelbo, global_step = train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
+        train_nelbo, global_step = train(train_queue, model, cnn_optimizer, grad_scalar, global_step, epoch,
+                                         warmup_iters, writer, logging, comet_experiment=experiment, args=args)
         logging.info('train_nelbo %f', train_nelbo)
         writer.add_scalar('train/nelbo', train_nelbo, global_step)
 
         model.eval()
         # generate samples less frequently
-        eval_freq = 1 if args.epochs <= 50 else 20
+        eval_freq = 1 if args.epochs <= 20 else 4
         if epoch % eval_freq == 0 or epoch == (args.epochs - 1):
             with torch.no_grad():
                 num_samples = 16
@@ -106,7 +110,9 @@ def main(args):
                 for t in [0.7, 0.8, 0.9, 1.0]:
                     logits = model.sample(num_samples, t)
                     output = model.decoder_output(logits)
-                    output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample(t)
+                    output_img = output.mean if isinstance(output,
+                                                           torch.distributions.bernoulli.Bernoulli) else output.sample(
+                        t)
                     output_tiled = utils.tile_image(output_img, n)
                     writer.add_image('generated_%0.1f' % t, output_tiled, global_step)
 
@@ -119,6 +125,10 @@ def main(args):
             writer.add_scalar('val/nelbo', valid_nelbo, epoch)
             writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch)
             writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch)
+            experiment.log_metric('val/neg_log_p', valid_neg_log_p, epoch=epoch, step=global_step)
+            experiment.log_metric('val/nelbo', valid_nelbo, epoch=epoch, step=global_step)
+            experiment.log_metric('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch=epoch, step=global_step)
+            experiment.log_metric('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch=epoch, step=global_step)
 
         save_freq = int(np.ceil(args.epochs / 100))
         if epoch % save_freq == 0 or epoch == (args.epochs - 1):
@@ -137,21 +147,26 @@ def main(args):
     writer.add_scalar('val/nelbo', valid_nelbo, epoch + 1)
     writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch + 1)
     writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch + 1)
+    experiment.log_metric('val/neg_log_p', valid_neg_log_p, epoch=epoch + 1)
+    experiment.log_metric('val/nelbo', valid_nelbo, epoch=epoch + 1)
+    experiment.log_metric('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch=epoch + 1)
+
     writer.close()
 
 
-def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
+def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, epoch, warmup_iters, writer, logging,
+          comet_experiment, args):
     alpha_i = utils.kl_balancer_coeff(num_scales=model.num_latent_scales,
                                       groups_per_scale=model.groups_per_scale, fun='square')
     nelbo = utils.AvgrageMeter()
     model.train()
+    total_len = len(train_queue)
     for step, x in enumerate(train_queue):
         x = x[0] if len(x) > 1 else x
         x = x.cuda()
-
         # change bit length
         x = utils.pre_process(x, args.num_x_bits)
-
+        batch_size = x.size(0)
         # warm-up lr
         if global_step < warmup_iters:
             lr = args.learning_rate * float(global_step) / warmup_iters
@@ -180,7 +195,8 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             # get spectral regularization coefficient (lambda)
             if args.weight_decay_norm_anneal:
                 assert args.weight_decay_norm_init > 0 and args.weight_decay_norm > 0, 'init and final wdn should be positive.'
-                wdn_coeff = (1. - kl_coeff) * np.log(args.weight_decay_norm_init) + kl_coeff * np.log(args.weight_decay_norm)
+                wdn_coeff = (1. - kl_coeff) * np.log(args.weight_decay_norm_init) + kl_coeff * np.log(
+                    args.weight_decay_norm)
                 wdn_coeff = np.exp(wdn_coeff)
             else:
                 wdn_coeff = args.weight_decay_norm
@@ -192,13 +208,13 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         grad_scalar.step(cnn_optimizer)
         grad_scalar.update()
         nelbo.update(loss.data, 1)
-
-        if (global_step + 1) % 100 == 0:
+        if (global_step + 1) % 10 == 0:
             if (global_step + 1) % 1000 == 0:  # reduced frequency
                 n = int(np.floor(np.sqrt(x.size(0))))
-                x_img = x[:n*n]
-                output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample()
-                output_img = output_img[:n*n]
+                x_img = x[:n * n]
+                output_img = output.mean if isinstance(output,
+                                                       torch.distributions.bernoulli.Bernoulli) else output.sample()  # sample from the distribution
+                output_img = output_img[:n * n]
                 x_tiled = utils.tile_image(x_img, n)
                 output_tiled = utils.tile_image(output_img, n)
                 in_out_tiled = torch.cat((x_tiled, output_tiled), dim=2)
@@ -208,16 +224,35 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             writer.add_scalar('train/norm_loss', norm_loss, global_step)
             writer.add_scalar('train/bn_loss', bn_loss, global_step)
             writer.add_scalar('train/norm_coeff', wdn_coeff, global_step)
+            if comet_experiment is not None:
+                comet_experiment.log_metric('train/norm_loss', norm_loss, step=global_step)
+                comet_experiment.log_metric('train/bn_loss', bn_loss, step=global_step)
+                comet_experiment.log_metric('train/norm_coeff', wdn_coeff, step=global_step)
 
             utils.average_tensor(nelbo.avg, args.distributed)
-            logging.info('train %d %f', global_step, nelbo.avg)
+            logging.info('train epoch: %d-[%d/%d] \t globalstep: %d \t nelbo: %f \t loss: %f', epoch, step + 1,
+                         total_len, global_step + 1, nelbo.avg, loss)
             writer.add_scalar('train/nelbo_avg', nelbo.avg, global_step)
             writer.add_scalar('train/lr', cnn_optimizer.state_dict()[
-                              'param_groups'][0]['lr'], global_step)
+                'param_groups'][0]['lr'], global_step)
             writer.add_scalar('train/nelbo_iter', loss, global_step)
             writer.add_scalar('train/kl_iter', torch.mean(sum(kl_all)), global_step)
-            writer.add_scalar('train/recon_iter', torch.mean(utils.reconstruction_loss(output, x, crop=model.crop_output)), global_step)
+            writer.add_scalar('train/recon_iter',
+                              torch.mean(utils.reconstruction_loss(output, x, crop=model.crop_output)), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
+
+            if comet_experiment is not None:
+                comet_experiment.log_metric('train/nelbo_avg', nelbo.avg, step=global_step, epoch=epoch)
+                comet_experiment.log_metric('train/nelbo_bpd',
+                                            nelbo.avg * (1. / np.log(2.) / utils.num_output(args.dataset)),
+                                            step=global_step, epoch=epoch)
+                comet_experiment.log_metric('train/nelbo_iter', loss, step=global_step, epoch=epoch)
+                comet_experiment.log_metric('train/kl_iter', torch.mean(sum(kl_all)), step=global_step, epoch=epoch)
+                comet_experiment.log_metric('train/recon_iter',
+                                            torch.mean(utils.reconstruction_loss(output, x, crop=model.crop_output)),
+                                            step=global_step, epoch=epoch)
+                comet_experiment.log_metric('kl_coeff/coeff', kl_coeff, step=global_step, epoch=epoch)
+
             total_active = 0
             for i, kl_diag_i in enumerate(kl_diag):
                 utils.average_tensor(kl_diag_i, args.distributed)
@@ -228,9 +263,51 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 writer.add_scalar('kl/active_%d' % i, num_active, global_step)
                 writer.add_scalar('kl_coeff/layer_%d' % i, kl_coeffs[i], global_step)
                 writer.add_scalar('kl_vals/layer_%d' % i, kl_vals[i], global_step)
+                if comet_experiment is not None:
+                    comet_experiment.log_metric('kl/active_%d' % i, num_active, step=global_step, epoch=epoch)
+                    comet_experiment.log_metric('kl_coeff/layer_%d' % i, kl_coeffs[i], step=global_step, epoch=epoch)
+                    comet_experiment.log_metric('kl_vals/layer_%d' % i, kl_vals[i], step=global_step, epoch=epoch)
+
             writer.add_scalar('kl/total_active', total_active, global_step)
+            if comet_experiment is not None:
+                comet_experiment.log_metric('kl/total_active', total_active, step=global_step)
 
         global_step += 1
+    if epoch % 1 == 0:
+        # result = np.zeros((n * img_size, n * img_size, 3), dtype=np.uint8)
+        with torch.no_grad():
+            print('we are here')
+            for t in [0.7]:
+                # output_tiled = utils.tile_image(output_img, n)
+                # in_out_tiled = torch.cat((x_tiled, output_tiled), dim=2)
+                # from PIL import Image
+                # im = Image.fromarray(output_tiled)
+                # im.save(os.path.join('/usr/local/data/nimafh/NVAE/imgs/', 'sample-%d.png' % (global_step)))
+                logits = model.sample(batch_size, t)
+                output = model.decoder_output(logits)
+                # output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample(t)
+                # # output_tiled = utils.tile_image(output_img, n)
+                # print(output.shape)
+                n = int(np.floor(np.sqrt(batch_size)))
+                output_img = output.mean if isinstance(output,
+                                                       torch.distributions.bernoulli.Bernoulli) else output.sample(
+                    t)  # sample from the distribution
+                output_img = output_img[:n * n]
+                output_tiled = utils.tile_image(output_img, n)
+                gen_imgs = output_tiled.cpu().numpy().transpose(1, 2, 0)
+                gen_imgs = np.asarray(gen_imgs * 255, dtype=np.uint8)
+                gen_imgs = np.squeeze(gen_imgs)
+                # gen_imgs = output_img.reshape(n, n, 3, img_size, img_size)
+                # gen_imgs = gen_imgs.permute(0, 1, 3, 4, 2)
+                # gen_imgs = gen_imgs.cpu().numpy()  * 255
+                # gen_imgs = gen_imgs.astype(np.uint8)
+        # for i in range(n):
+        #     for j in range(n):
+        #         result[i * img_size:(i + 1) * img_size, j * img_size:(j + 1) * img_size] = gen_imgs[i, j]
+        from PIL import Image
+        im = Image.fromarray(gen_imgs)
+
+        comet_experiment.log_image(im, name=f"epoch: {epoch}.jpeg", step=epoch)
 
     utils.average_tensor(nelbo.avg, args.distributed)
     return nelbo.avg, global_step
@@ -242,7 +319,9 @@ def test(valid_queue, model, num_samples, args, logging):
     nelbo_avg = utils.AvgrageMeter()
     neg_log_p_avg = utils.AvgrageMeter()
     model.eval()
+    print("valid queue length", len(valid_queue))
     for step, x in enumerate(valid_queue):
+        print(f"valid step {step}")
         x = x[0] if len(x) > 1 else x
         x = x.cuda()
 
@@ -318,10 +397,16 @@ def test_vae_fid(model, args, total_fid_samples):
 def init_processes(rank, size, fn, args):
     """ Initialize the distributed environment. """
     os.environ['MASTER_ADDR'] = args.master_address
-    os.environ['MASTER_PORT'] = '6020'
+    os.environ['MASTER_PORT'] = '6021'
     torch.cuda.set_device(args.local_rank)
     dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size)
-    fn(args)
+    cometml_logger = None
+    args_fields = {k: v for k, v in vars(args).items()}
+    cometml_logger = CometML(api_key=args.comet_api_key, disabled=args.disable_comet,
+                             project_name=args.comet_project_name, workspace=args.comet_workspace,
+                             parameters=args_fields)
+
+    fn(args, cometml_logger)
     cleanup()
 
 
@@ -332,6 +417,8 @@ def cleanup():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('encoder decoder examiner')
     # experimental results
+    parser.add_argument("--id", type=int, required=True, help="an unique number for identifying the experiment")
+
     parser.add_argument('--root', type=str, default='/tmp/nasvae/expr',
                         help='location of the results')
     parser.add_argument('--save', type=str, default='exp',
@@ -357,14 +444,14 @@ if __name__ == '__main__':
                         help='The lambda parameter for spectral regularization.')
     parser.add_argument('--weight_decay_norm_init', type=float, default=10.,
                         help='The initial lambda parameter')
-    parser.add_argument('--weight_decay_norm_anneal', action='store_true', default=False,
+    parser.add_argument('--weight_decay_norm_anneal', action='store_true', default=True,
                         help='This flag enables annealing the lambda coefficient from '
                              '--weight_decay_norm_init to --weight_decay_norm.')
     parser.add_argument('--epochs', type=int, default=200,
                         help='num of training epochs')
     parser.add_argument('--warmup_epochs', type=int, default=5,
                         help='num of training epochs in which lr is warmed up')
-    parser.add_argument('--fast_adamax', action='store_true', default=False,
+    parser.add_argument('--fast_adamax', action='store_true', default=True,
                         help='This flag enables using our optimized adamax.')
     parser.add_argument('--arch_instance', type=str, default='res_mbconv',
                         help='path to the architecture instance')
@@ -387,7 +474,7 @@ if __name__ == '__main__':
                         help='number of groups of latent variables per scale')
     parser.add_argument('--num_latent_per_group', type=int, default=20,
                         help='number of channels in latent variables per group')
-    parser.add_argument('--ada_groups', action='store_true', default=False,
+    parser.add_argument('--ada_groups', action='store_true', default=True,
                         help='Settings this to true will set different number of groups per scale.')
     parser.add_argument('--min_groups_per_scale', type=int, default=1,
                         help='the minimum number of groups per scale.')
@@ -412,9 +499,9 @@ if __name__ == '__main__':
     parser.add_argument('--num_mixture_dec', type=int, default=10,
                         help='number of mixture components in decoder. set to 1 for Normal decoder.')
     # NAS
-    parser.add_argument('--use_se', action='store_true', default=False,
+    parser.add_argument('--use_se', action='store_true', default=True,
                         help='This flag enables squeeze and excitation.')
-    parser.add_argument('--res_dist', action='store_true', default=False,
+    parser.add_argument('--res_dist', action='store_true', default=True,
                         help='This flag enables squeeze and excitation.')
     parser.add_argument('--cont_training', action='store_true', default=False,
                         help='This flag enables training from an existing checkpoint.')
@@ -433,6 +520,15 @@ if __name__ == '__main__':
                         help='address for master')
     parser.add_argument('--seed', type=int, default=1,
                         help='seed used for initialization')
+
+    # Comet
+    parser.add_argument('--comet_api_key', type=str, default=None, help='comet api key')
+    parser.add_argument('--comet_project_name', type=str, default="NVAE", help='comet project name')
+    parser.add_argument('--comet_workspace', type=str, default="nimafh", help='comet workspace')
+    parser.add_argument('--disable_comet', action='store_true', default=False)
+    # FID
+    parser.add_argument('--fid_dir', type=str, default='/usr/local/data/nimafh/fid/')
+
     args = parser.parse_args()
     args.save = args.root + '/eval-' + args.save
     utils.create_exp_dir(args.save)
