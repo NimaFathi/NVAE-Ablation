@@ -11,6 +11,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 from time import time
+import torch.distributed as dist
 
 from torch.multiprocessing import Process
 from torch.cuda.amp import autocast
@@ -18,7 +19,24 @@ from torch.cuda.amp import autocast
 from model import AutoEncoder
 import utils
 import datasets
-from train import test, init_processes, test_vae_fid
+from train import test, test_vae_fid
+
+
+def init_processes(rank, size, fn, args):
+    """ Initialize the distributed environment. """
+    os.environ['MASTER_ADDR'] = args.master_address
+    os.environ['MASTER_PORT'] = '6022'
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size)
+    cometml_logger = None
+    args_fields = {k: v for k, v in vars(args).items()}
+
+    fn(args)
+    cleanup()
+
+
+def cleanup():
+    dist.destroy_process_group()
 
 
 def set_bn(model, bn_eval_mode, num_samples=1, t=1.0, iter=100):
@@ -29,7 +47,7 @@ def set_bn(model, bn_eval_mode, num_samples=1, t=1.0, iter=100):
         with autocast():
             for i in range(iter):
                 if i % 10 == 0:
-                    print('setting BN statistics iter %d out of %d' % (i+1, iter))
+                    print('setting BN statistics iter %d out of %d' % (i + 1, iter))
                 model.sample(num_samples, t)
         model.eval()
 
@@ -85,7 +103,8 @@ def main(eval_args):
         num_output = utils.num_output(args.dataset)
         bpd_coeff = 1. / np.log(2.) / num_output
 
-        valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=eval_args.num_iw_samples, args=args, logging=logging)
+        valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=eval_args.num_iw_samples, args=args,
+                                            logging=logging)
         logging.info('final valid nelbo %f', valid_nelbo)
         logging.info('final valid neg log p %f', valid_neg_log_p)
         logging.info('final valid nelbo in bpd %f', valid_nelbo * bpd_coeff)
@@ -94,19 +113,19 @@ def main(eval_args):
         bn_eval_mode = not eval_args.readjust_bn
         set_bn(model, bn_eval_mode, num_samples=2, t=eval_args.temp, iter=500)
         args.fid_dir = eval_args.fid_dir
-        args.num_process_per_node, args.num_proc_node = eval_args.world_size, 1   # evaluate only one 1 node
+        args.num_process_per_node, args.num_proc_node = eval_args.world_size, 1  # evaluate only one 1 node
         fid = test_vae_fid(model, args, total_fid_samples=50000)
         logging.info('fid is %f' % fid)
     else:
         bn_eval_mode = not eval_args.readjust_bn
-        total_samples = 50000 // eval_args.world_size          # num images per gpu
-        num_samples = 100                                      # sampling batch size
-        num_iter = int(np.ceil(total_samples / num_samples))   # num iterations per gpu
+        total_samples = 5000 // eval_args.world_size  # num images per gpu
+        num_samples = 64  # sampling batch size
+        num_iter = int(np.ceil(total_samples / num_samples))  # num iterations per gpu
 
         with torch.no_grad():
             n = int(np.floor(np.sqrt(num_samples)))
-            set_bn(model, bn_eval_mode, num_samples=16, t=eval_args.temp, iter=500)
-            for ind in range(num_iter):     # sampling is repeated.
+            set_bn(model, bn_eval_mode, num_samples=num_samples, t=eval_args.temp, iter=500)
+            for ind in range(num_iter):  # sampling is repeated.
                 torch.cuda.synchronize()
                 start = time()
                 with autocast():
@@ -118,16 +137,20 @@ def main(eval_args):
                 end = time()
                 logging.info('sampling time per batch: %0.3f sec', (end - start))
 
-                visualize = False
+                visualize = True
                 if visualize:
+                    from PIL import Image
                     output_tiled = utils.tile_image(output_img, n).cpu().numpy().transpose(1, 2, 0)
                     output_tiled = np.asarray(output_tiled * 255, dtype=np.uint8)
                     output_tiled = np.squeeze(output_tiled)
 
-                    plt.imshow(output_tiled)
-                    plt.show()
+                    im = Image.fromarray(output_tiled)
+                    im.save(os.path.join(eval_args.save, 'CELEBA256_3/gpu_%d_samples_%d_temp_%d.png' % (
+                    eval_args.local_rank, ind, eval_args.temp)))
+
                 else:
-                    file_path = os.path.join(eval_args.save, 'gpu_%d_samples_%d.npz' % (eval_args.local_rank, ind))
+                    file_path = os.path.join(eval_args.save, 'Mnist32_gpu_%d_samples_%d_temp_%d.npz' % (
+                    eval_args.local_rank, ind, eval_args.temp))
                     np.savez_compressed(file_path, samples=output_img.cpu().numpy())
                     logging.info('Saved at: {}'.format(file_path))
 
@@ -135,9 +158,10 @@ def main(eval_args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('encoder decoder examiner')
     # experimental results
+
     parser.add_argument('--checkpoint', type=str, default='/tmp/expr/checkpoint.pt',
                         help='location of the checkpoint')
-    parser.add_argument('--save', type=str, default='/tmp/expr',
+    parser.add_argument('--save', type=str, default='/usr/local/data/nimafh/NVAE/imgs/',
                         help='location of the checkpoint')
     parser.add_argument('--eval_mode', type=str, default='sample', choices=['sample', 'evaluate', 'evaluate_fid'],
                         help='evaluation mode. you can choose between sample or evaluate.')
